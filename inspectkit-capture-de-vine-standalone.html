@@ -969,6 +969,7 @@ html, body {
   .header-save-btn::before { font-size: 20px; }
   #save-json-btn::before  { content: "↓"; }
   #load-json-btn::before  { content: "↑"; }
+  #ik-newbtn::before      { content: "+"; font-weight: 700; }
 
   /* iOS hint: hidden on mobile — buttons are icon-only, hint not needed in header */
   #ios-save-hint { display: none !important; }
@@ -3641,21 +3642,19 @@ document.addEventListener("DOMContentLoaded", () => {
   document.documentElement.style.setProperty("--secondary", cfg.secondaryTextOnLight);
   document.documentElement.style.setProperty("--border", cfg.borderColor);
 
-  // Report number and date
-  IK.reportNumber = cfg.generateReportNumber();
-  IK.reportDate   = cfg.todayDisplay();
-  document.getElementById("header-report-num").textContent  = IK.reportNumber;
-  document.getElementById("header-report-date").textContent = IK.reportDate;
+  // Report number + date are assigned by the on-device store boot (bootStore, at the
+  // end of init): restored from a saved in-progress report, or generated once for a
+  // new one. They are no longer regenerated on every load (fixes report-number drift),
+  // and nothing is written to storage until that restore/new decision is made.
 
   // Default inspection date to today
   const today = new Date().toISOString().split("T")[0];
   document.getElementById("insp-date").value = today;
 
-  // Auto-fill declaration
+  // Auto-fill declaration (config-based; declaration date is set by bootStore)
   document.getElementById("decl-inspector-name").value = cfg.inspectorName;
   document.getElementById("decl-lbp").value             = cfg.inspectorCredential;
   document.getElementById("decl-company").value         = cfg.inspectorCompany || cfg.companyName;
-  document.getElementById("decl-date").value            = IK.reportDate;
 
   // Build room nav + panels
   buildRooms(cfg.defaultRooms);
@@ -3724,6 +3723,11 @@ document.addEventListener("DOMContentLoaded", () => {
     const match = onclickAttr.match(/toggleOptionalRoom\('([^']+)'\)/);
     if (match) toggleOptionalRoom(match[1]);
   }, { passive: false, capture: true });
+
+  // ── On-device store (Phase 1 Step A): install the save UI, then restore a saved
+  // in-progress report or start a new one. Runs last, after all panels exist. ──
+  installStoreUI();
+  bootStore();
 });
 
 // ─── Section Navigation ─────────────────────────────────────────────────
@@ -4016,8 +4020,10 @@ function addRoomToUI(room, removable) {
   const roomLimPanel = document.getElementById(sId + "-limitation-panel");
   if (roomLimPanel) buildLimitationPanel(sId, roomLimPanel);
 
-  // Track in state
-  IK.sectionStates[sId] = "not_started";
+  // Track in state. Only default to "not_started" when there is no state yet —
+  // so rebuilding a room during restore never erases its saved Inspected/Partial/
+  // Not-Inspected state (a brand-new room added in-session still gets not_started).
+  if (IK.sectionStates[sId] === undefined) IK.sectionStates[sId] = "not_started";
   if (!IK.rooms.find(r => r.id === room.id)) {
     IK.rooms.push(room);
   }
@@ -5183,18 +5189,35 @@ function collectFormData() {
     });
 
     // Moisture readings — dynamic entries (room-X-moist-1, room-X-moist-2, ...)
-    let moistIdx = 1;
-    while (true) {
-      const base = sId + "-moist-" + moistIdx;
-      const loc  = v(base + "-location");
-      const val2 = v(base + "-value");
-      if (!document.getElementById(base + "-block")) break;
-      if (loc)  IK.fields[base + "-location"] = loc;
-      if (val2) IK.fields[base + "-value"]    = val2;
-      moistIdx++;
-      if (moistIdx > 20) break;
+    // Scan the reading blocks actually present rather than counting consecutive
+    // indices and breaking at the first gap: a reading added after an earlier one
+    // was removed would otherwise be dropped at save (and its typed data lost).
+    // Clear this room's stale saved readings first so a removed reading can't
+    // linger in the saved data. Each block keeps its own index; count is the
+    // highest index present (the renderer drops empty indices and renumbers for
+    // display, and removal renumbers survivors contiguously).
+    Object.keys(IK.fields).forEach(k => {
+      if (k.startsWith(sId + "-moist-") &&
+          (k.endsWith("-location") || k.endsWith("-value"))) delete IK.fields[k];
+    });
+    const moistContainer = document.getElementById(sId + "-moisture-readings");
+    let moistMax = 0;
+    if (moistContainer) {
+      moistContainer.querySelectorAll('[id$="-block"]').forEach(block => {
+        const bid = block.id;
+        if (!bid.startsWith(sId + "-moist-")) return;
+        const mid = bid.slice((sId + "-moist-").length, -"-block".length);
+        if (!/^\d+$/.test(mid)) return; // guard against nested/unrelated -block ids
+        const n    = parseInt(mid, 10);
+        const base = sId + "-moist-" + n;
+        const loc  = v(base + "-location");
+        const val2 = v(base + "-value");
+        if (loc)  IK.fields[base + "-location"] = loc;
+        if (val2) IK.fields[base + "-value"]    = val2;
+        if (n > moistMax) moistMax = n;
+      });
     }
-    IK.fields[sId + "-moist-count"] = String(moistIdx - 1);
+    IK.fields[sId + "-moist-count"] = String(moistMax);
   });
 
   // ── Collect outbuilding fields dynamically ──
@@ -5245,16 +5268,391 @@ function v(id) {
   return el.value !== undefined ? el.value.trim() : "";
 }
 
-// ─── Autosave (debounced) ──────────────────────────────────────────────
+// ─── On-device store (Phase 1 — Step A): IndexedDB working copy ─────────
+// Replaces the old localStorage draft, which silently hit the ~5 MB iOS cap
+// (quota error was swallowed) and was never restored on load. The whole report
+// is kept in IndexedDB and rebuilt on open, so a reload / background / lock can
+// no longer blank the form. (Photos move to their own records in Step B; here the
+// whole report, photos included, is one record — correct, just heavier to write.)
+const IKDB = (function () {
+  const DB_NAME = "inspectkit", DB_VERSION = 2;   // v2 (Step B) adds the "photos" store
+  let _db = null;
+  function open() {
+    return new Promise((resolve, reject) => {
+      if (_db) return resolve(_db);
+      let req;
+      try { req = indexedDB.open(DB_NAME, DB_VERSION); }
+      catch (e) { return reject(e); }
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        // Idempotent upgrade (covers fresh installs and v1 → v2).
+        if (!db.objectStoreNames.contains("reports")) db.createObjectStore("reports", { keyPath: "reportId" });
+        if (!db.objectStoreNames.contains("photos")) {
+          const ps = db.createObjectStore("photos", { keyPath: "photoId" });
+          ps.createIndex("byReport", "reportId", { unique: false });
+        }
+      };
+      req.onsuccess = () => { _db = req.result; resolve(_db); };
+      req.onerror   = () => reject(req.error || new Error("indexedDB.open failed"));
+    });
+  }
+  function run(store, mode, makeReq) {
+    return open().then(db => new Promise((resolve, reject) => {
+      let req;
+      try { req = makeReq(db.transaction(store, mode).objectStore(store)); }
+      catch (e) { return reject(e); }
+      req.onsuccess = () => resolve(req.result);
+      req.onerror   = () => reject(req.error || new Error("IDB request failed"));
+    }));
+  }
+  return {
+    put:    (rec) => run("reports", "readwrite", s => s.put(rec)),
+    del:    (id)  => run("reports", "readwrite", s => s.delete(id)),
+    get:    (id)  => run("reports", "readonly",  s => s.get(id)),
+    getAll: ()    => run("reports", "readonly",  s => s.getAll()),
+    putPhoto: (rec) => run("photos", "readwrite", s => s.put(rec)),
+    delPhoto: (id)  => run("photos", "readwrite", s => s.delete(id)),
+    getPhotosByReport: (reportId) => run("photos", "readonly", s => s.index("byReport").getAll(IDBKeyRange.only(reportId))),
+  };
+})();
+
+// ── Active-report + autosave state ──
+let activeReportId = null;   // null until a report is restored or newly started → gates autosave
+let activeCreatedAt = null;
+let currentStatus = "in_progress";
+let lastSavedAt = null;
+let degraded = false;        // true when IndexedDB is unavailable (private mode etc.)
 let autosaveTimer = null;
+let persistedPhotoIds = new Set();   // Step B: photo ids already written to the photos store for the active report
+let lastEditAt = null;       // Step C: time of last real content edit (set in autosave)
+let lastExportedAt = null;   // Step C: time the report was last exported (set when Save JSON runs)
+
+// Debounced autosave. GATED: writes nothing until a report is active, so a blank or
+// default form on reload can never overwrite stored data.
 function autosave() {
+  if (degraded || !activeReportId) return;
+  lastEditAt = new Date();   // Step C: track last edit for the Begin-New export-status warning
   clearTimeout(autosaveTimer);
-  autosaveTimer = setTimeout(() => {
-    collectFormData();
+  autosaveTimer = setTimeout(persistNow, 1200);
+}
+
+// ── base64 <-> Blob (Step B photo storage) ──
+function dataURLToBlob(dataURL) {
+  const comma = dataURL.indexOf(",");
+  const header = dataURL.slice(0, comma);
+  const mime = (header.match(/data:([^;]+)/) || [, "image/jpeg"])[1];
+  const body = dataURL.slice(comma + 1);
+  if (!/;base64/i.test(header)) return new Blob([decodeURIComponent(body)], { type: mime });
+  const bin = atob(body), len = bin.length, bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+function blobToDataURL(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error || new Error("blob read failed"));
+    r.readAsDataURL(blob);
+  });
+}
+
+// Step B: photos are written once to the photos store (as Blobs), so autosave only
+// rewrites the small form-data record instead of re-serialising every photo each time.
+async function persistNow() {
+  if (degraded || !activeReportId) return;
+  collectFormData();
+  const rid = activeReportId;
+  try {
+    const photos = IK.photos || {};
+    const liveIds = Object.keys(photos);
+    const liveSet = new Set(liveIds);
+    // Write only NEW photos (base64 → Blob), once each.
+    for (const id of liveIds) {
+      if (persistedPhotoIds.has(id)) continue;
+      const p = photos[id];
+      if (p && p.data) {
+        await IKDB.putPhoto({ photoId: id, reportId: rid, blob: dataURLToBlob(p.data) });
+        persistedPhotoIds.add(id);
+      }
+    }
+    // Drop photos removed since the last save.
+    for (const id of Array.from(persistedPhotoIds)) {
+      if (!liveSet.has(id)) { await IKDB.delPhoto(id); persistedPhotoIds.delete(id); }
+    }
+    // Write the light report record (photo bytes stripped — see buildRecord).
+    await IKDB.put(buildRecord());
+    lastSavedAt = new Date(); setSaveIndicator("ok");
+  } catch (err) {
+    console.warn("InspectKit save failed", err); setSaveIndicator("fail");
+    showStoreError("Save failed — your latest changes may not be stored on this device. Export to JSON now.");
+  }
+}
+
+function buildRecord() {
+  let data;
+  try { data = JSON.parse(JSON.stringify(IK)); } catch (e) { data = Object.assign({}, IK); }
+  // Strip photo base64 from the report record — the bytes live in the photos store.
+  // Keep each photo's elemId + caption (small; caption can change after capture).
+  // (elevationPhotos stay inline: only 4, not worth splitting.)
+  if (data.photos) {
+    const meta = {};
+    for (const id in data.photos) {
+      const p = data.photos[id] || {};
+      meta[id] = { elemId: p.elemId, caption: p.caption || "" };
+    }
+    data.photos = meta;
+  }
+  return {
+    reportId:   activeReportId,
+    data:       data,
+    reportNumber: IK.reportNumber || "",
+    address:    (IK.propertyDetails && IK.propertyDetails.address) || "",
+    status:     currentStatus || "in_progress",
+    createdAt:  activeCreatedAt || new Date().toISOString(),
+    updatedAt:  new Date().toISOString(),
+    lastEditAt:     lastEditAt ? lastEditAt.toISOString() : null,
+    lastExportedAt: lastExportedAt ? lastExportedAt.toISOString() : null,
+    photoStore: true,
+  };
+}
+
+function setReportHeader() {
+  const n  = document.getElementById("header-report-num");  if (n)  n.textContent = IK.reportNumber;
+  const d  = document.getElementById("header-report-date"); if (d)  d.textContent = IK.reportDate;
+  const dd = document.getElementById("decl-date");          if (dd && !dd.value) dd.value = IK.reportDate;
+}
+
+// Assign a stable internal id for an active report and write it immediately so the
+// record exists before any edit. Does NOT touch the report number (caller owns that).
+function adoptActiveReport(status) {
+  activeReportId  = "rpt_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8);
+  activeCreatedAt = new Date().toISOString();
+  currentStatus   = status || "in_progress";
+  persistedPhotoIds = new Set();   // fresh report (or imported) → nothing in the photos store yet
+  persistNow();
+}
+
+// Start a brand-new report: number generated ONCE here, persisted, and reused on
+// reload (no longer regenerated every load).
+function startNewReport() {
+  IK.reportNumber = INSPECTKIT_CONFIG.generateReportNumber();
+  IK.reportDate   = INSPECTKIT_CONFIG.todayDisplay();
+  setReportHeader();
+  adoptActiveReport("in_progress");
+}
+
+function enterDegradedMode() {
+  degraded = true;
+  try {
+    IK.reportNumber = INSPECTKIT_CONFIG.generateReportNumber();
+    IK.reportDate   = INSPECTKIT_CONFIG.todayDisplay();
+    setReportHeader();
+  } catch (e) {}
+  setSaveIndicator("fail");
+  showStoreError("On-device saving is unavailable in this browser or private mode. Your work is NOT being saved — export to JSON frequently.");
+}
+
+// Run after all panels exist: restore a saved in-progress report, or start fresh.
+async function bootStore() {
+  // Step C: an explicit "Begin New Report" reloads with this flag → start fresh, skip restore.
+  let forceNew = false;
+  try { forceNew = sessionStorage.getItem("ik_start_new") === "1"; if (forceNew) sessionStorage.removeItem("ik_start_new"); } catch (e) {}
+  if (forceNew) { startNewReport(); return; }
+
+  let reports = null;
+  try { reports = await IKDB.getAll(); }
+  catch (e) { enterDegradedMode(); return; }   // read failed → never write, warn loudly
+
+  const inProgress = (reports || [])
+    .filter(r => r && r.data && r.status !== "exported")
+    .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+
+  if (inProgress.length > 0) {
+    const rec = inProgress[0];
     try {
-      localStorage.setItem("inspectkit_draft_" + IK.reportNumber, JSON.stringify(IK));
-    } catch(e) { /* storage full or unavailable */ }
-  }, 800);
+      const data = rec.data || {};
+      // Reassemble photo base64 from the photos store, so the existing restore path
+      // (resumeFromJSON) is unchanged. Old Step-A records keep base64 inline in
+      // data.photos — used as-is, then migrated to the photos store on the next save.
+      persistedPhotoIds = new Set();
+      if (data.photos) {
+        let blobs = [];
+        try { blobs = await IKDB.getPhotosByReport(rec.reportId); } catch (e) { blobs = []; }
+        const blobMap = {};
+        (blobs || []).forEach(b => { if (b && b.photoId) blobMap[b.photoId] = b.blob; });
+        for (const id in data.photos) {
+          const meta = data.photos[id] || {};
+          if (meta.data) continue;                       // old-format: base64 already present
+          if (blobMap[id]) { meta.data = await blobToDataURL(blobMap[id]); persistedPhotoIds.add(id); }
+        }
+      }
+      resumeFromJSON(data, { fromStore: true });   // rebuild the form from the stored report
+      activeReportId  = rec.reportId;              // enable autosave only AFTER a clean restore
+      activeCreatedAt = rec.createdAt;
+      currentStatus   = rec.status || "in_progress";
+      lastSavedAt     = rec.updatedAt ? new Date(rec.updatedAt) : null;
+      lastEditAt      = rec.lastEditAt ? new Date(rec.lastEditAt) : null;
+      lastExportedAt  = rec.lastExportedAt ? new Date(rec.lastExportedAt) : null;
+      setSaveIndicator("ok");
+      showRestoredNotice(rec.updatedAt);
+    } catch (e) {
+      // Restore failed — do NOT enable autosave, so the stored record stays intact.
+      console.error("InspectKit restore failed", e);
+      showStoreError("Could not restore your saved report automatically. It is still stored on this device — reload to try again before entering new data.");
+    }
+  } else {
+    startNewReport();   // no saved report → start fresh (a new record, never an overwrite)
+  }
+}
+
+// Last-chance flush when the app is backgrounded. Uses visibilitychange only —
+// never pagehide/unload, which are unreliable on iOS.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && activeReportId && !degraded) {
+    clearTimeout(autosaveTimer);
+    persistNow();
+  }
+});
+
+// ── Minimal, self-contained save UI (injected; no HTML/CSS surgery) ──
+function installStoreUI() {
+  if (document.getElementById("ik-store-style")) return;
+  const style = document.createElement("style");
+  style.id = "ik-store-style";
+  style.textContent =
+    "#ik-save-ind{position:fixed;right:10px;bottom:10px;z-index:9998;font:600 11px/1 -apple-system,Segoe UI,Roboto,sans-serif;padding:6px 10px;border-radius:14px;background:rgba(240,244,248,.95);color:#44515e;box-shadow:0 1px 4px rgba(0,0,0,.18);pointer-events:none}" +
+    "#ik-save-ind.ik-fail{background:#C0392B;color:#fff}" +
+    "#ik-restored{position:fixed;top:10px;left:50%;transform:translateX(-50%);z-index:9999;font:600 12px/1.3 -apple-system,Segoe UI,Roboto,sans-serif;padding:9px 14px;border-radius:10px;background:#1E3A5F;color:#fff;box-shadow:0 3px 10px rgba(0,0,0,.25);max-width:92vw;text-align:center;transition:opacity .4s;opacity:1}" +
+    "#ik-store-error{position:fixed;top:0;left:0;right:0;z-index:10000;font:600 13px/1.35 -apple-system,Segoe UI,Roboto,sans-serif;padding:12px 16px;background:#C0392B;color:#fff;box-shadow:0 2px 8px rgba(0,0,0,.3);display:none}" +
+    "#ik-store-error button{margin-left:10px;background:#fff;color:#C0392B;border:0;border-radius:6px;padding:4px 10px;font:inherit;font-weight:700}" +
+    "#ik-bn-overlay{position:fixed;inset:0;z-index:10001;background:rgba(10,20,30,.55);display:none;align-items:center;justify-content:center;padding:18px}" +
+    "#ik-bn-overlay.open{display:flex}" +
+    "#ik-bn-dialog{background:#fff;color:#1b2733;max-width:420px;width:100%;border-radius:14px;box-shadow:0 10px 40px rgba(0,0,0,.35);overflow:hidden;font:400 14px/1.45 -apple-system,Segoe UI,Roboto,sans-serif}" +
+    "#ik-bn-dialog h2{margin:0;padding:15px 18px;font-size:17px;background:#1E3A5F;color:#fff}" +
+    "#ik-bn-body{padding:18px}" +
+    "#ik-bn-status{padding:11px 13px;border-radius:9px;font-weight:700;color:#fff;margin-bottom:14px}" +
+    "#ik-bn-note{margin:0 0 14px;color:#44515e}" +
+    "#ik-bn-actions{display:flex;flex-direction:column;gap:9px}" +
+    "#ik-bn-actions button{padding:12px 14px;border-radius:9px;border:0;font:inherit;font-weight:700;cursor:pointer}" +
+    ".ik-bn-cancel{background:#eef2f6;color:#33414f}" +
+    ".ik-bn-export{background:#1E3A5F;color:#fff}" +
+    ".ik-bn-start{background:#C0392B;color:#fff}";
+  document.head.appendChild(style);
+  const ind = document.createElement("div");
+  ind.id = "ik-save-ind"; ind.textContent = "Not saved yet";
+  document.body.appendChild(ind);
+  const err = document.createElement("div");
+  err.id = "ik-store-error";
+  err.innerHTML = "<span id='ik-store-error-msg'></span><button type='button' onclick=\"document.getElementById('ik-store-error').style.display='none'\">Dismiss</button>";
+  document.body.appendChild(err);
+
+  // Step C: "🆕 New" button, inserted immediately left of the Save JSON button (mobile + desktop).
+  const saveBtn = document.getElementById("save-json-btn");
+  if (saveBtn && !document.getElementById("ik-newbtn")) {
+    const nb = document.createElement("button");
+    nb.id = "ik-newbtn";
+    nb.type = "button";
+    nb.className = saveBtn.className;         // match the existing header button system (shape + mobile icon)
+    nb.textContent = "New";                   // desktop: text; mobile: "+" icon via #ik-newbtn::before
+    nb.title = "Begin a new report";
+    nb.setAttribute("onclick", "openBeginNewDialog()");
+    saveBtn.parentNode.insertBefore(nb, saveBtn);
+  }
+
+  // Step C: Begin-New warning modal.
+  if (!document.getElementById("ik-bn-overlay")) {
+    const bn = document.createElement("div");
+    bn.id = "ik-bn-overlay";
+    bn.innerHTML =
+      "<div id='ik-bn-dialog' role='dialog' aria-modal='true' aria-labelledby='ik-bn-title'>" +
+        "<h2 id='ik-bn-title'>Begin a new report?</h2>" +
+        "<div id='ik-bn-body'>" +
+          "<div id='ik-bn-status'></div>" +
+          "<p id='ik-bn-note'>Starting a new report clears the current one from this device. Make sure its JSON has been saved first.</p>" +
+          "<div id='ik-bn-actions'>" +
+            "<button type='button' class='ik-bn-cancel' onclick='closeBeginNewDialog()'>Cancel</button>" +
+            "<button type='button' class='ik-bn-export' onclick='beginNewExportCurrent()'>Export current report first</button>" +
+            "<button type='button' class='ik-bn-start' onclick='beginNewConfirm()'>Start new report</button>" +
+          "</div>" +
+        "</div>" +
+      "</div>";
+    document.body.appendChild(bn);
+  }
+}
+
+// ── Step C: Begin New Report ───────────────────────────────────────────
+// Export-status for the warning box: red (never exported) / orange (edits since
+// last export) / green (export is current).
+function beginNewExportState() {
+  if (!lastExportedAt) return { color: "#C0392B", msg: "⚠ This report has not been exported yet." };
+  const t = hhmm(lastExportedAt);
+  if (lastEditAt && lastEditAt.getTime() > lastExportedAt.getTime())
+    return { color: "#E67E22", msg: "You've made changes since your last export (" + t + ") — they are not in that file." };
+  return { color: "#1E8449", msg: "Last exported " + t + "." };
+}
+function openBeginNewDialog() {
+  installStoreUI();
+  const st = beginNewExportState();
+  const s = document.getElementById("ik-bn-status");
+  if (s) { s.textContent = st.msg; s.style.background = st.color; }
+  const ov = document.getElementById("ik-bn-overlay");
+  if (ov) ov.classList.add("open");
+}
+function closeBeginNewDialog() {
+  const ov = document.getElementById("ik-bn-overlay");
+  if (ov) ov.classList.remove("open");
+}
+function beginNewExportCurrent() {
+  closeBeginNewDialog();
+  saveInspection();   // existing export (mandatory-field + referral checks). Verify it saved, then tap 🆕 again.
+}
+async function beginNewConfirm() {
+  closeBeginNewDialog();
+  // Clear the current report (record + its photos) from this device — no retention, no selector.
+  try {
+    if (activeReportId) {
+      let blobs = [];
+      try { blobs = await IKDB.getPhotosByReport(activeReportId); } catch (e) {}
+      for (const b of (blobs || [])) { try { await IKDB.delPhoto(b.photoId); } catch (e) {} }
+      try { await IKDB.del(activeReportId); } catch (e) {}
+    }
+  } catch (e) { console.warn("Begin-new cleanup failed", e); }
+  try { sessionStorage.setItem("ik_start_new", "1"); } catch (e) {}
+  location.reload();   // reload → bootStore starts a fresh report (correct number for today's date)
+}
+function markExported() {
+  lastExportedAt = new Date();
+  if (!degraded && activeReportId) persistNow();   // persist the export time for the warning
+}
+
+function hhmm(d) {
+  try { return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }); } catch (e) { return ""; }
+}
+
+function setSaveIndicator(state) {
+  const el = document.getElementById("ik-save-ind");
+  if (!el) return;
+  if (state === "ok") { el.classList.remove("ik-fail"); el.textContent = "Saved " + (lastSavedAt ? hhmm(lastSavedAt) : ""); }
+  else { el.classList.add("ik-fail"); el.textContent = "SAVE FAILED"; }
+}
+
+function showRestoredNotice(updatedAt) {
+  installStoreUI();
+  const old = document.getElementById("ik-restored"); if (old) old.remove();
+  const t = updatedAt ? hhmm(new Date(updatedAt)) : "";
+  const n = document.createElement("div");
+  n.id = "ik-restored";
+  n.textContent = "Restored your in-progress report" + (t ? " from " + t : "");
+  document.body.appendChild(n);
+  setTimeout(() => { n.style.opacity = "0"; setTimeout(() => n.remove(), 500); }, 4000);
+}
+
+function showStoreError(msg) {
+  installStoreUI();
+  const box = document.getElementById("ik-store-error");
+  const m   = document.getElementById("ik-store-error-msg");
+  if (m) m.textContent = msg;
+  if (box) box.style.display = "block";
 }
 
 // ─── iOS detection ────────────────────────────────────────────────────
@@ -5357,6 +5755,8 @@ function performSave(acknowledged) {
     a.click();
     URL.revokeObjectURL(url);
   }
+
+  markExported();   // Step C: record export time for the Begin-New warning
 }
 
 // ─── Specialist-referral save gate + acknowledgement dialog ─────────────
@@ -5419,6 +5819,8 @@ function handleLoadInspection(event) {
     try {
       const data = JSON.parse(e.target.result);
       resumeFromJSON(data);
+      // Persist the imported report to the on-device store so it survives reloads too.
+      if (!degraded) adoptActiveReport("in_progress");
     } catch(err) {
       alert("Could not read inspection file: " + err.message);
     }
@@ -5427,7 +5829,8 @@ function handleLoadInspection(event) {
   event.target.value = "";
 }
 
-function resumeFromJSON(data) {
+function resumeFromJSON(data, opts) {
+  opts = opts || {};
   // Restore report number (preserve original)
   IK.reportNumber = data.reportNumber || data._meta?.reportNumber || IK.reportNumber;
   document.getElementById("header-report-num").textContent = IK.reportNumber;
@@ -5446,6 +5849,30 @@ function resumeFromJSON(data) {
   IK.rooms             = data.rooms             || INSPECTKIT_CONFIG.defaultRooms;
   IK.floorLevel        = data.floorLevel        || {};
   IK.fields            = data.fields            || {};
+
+  // ── Rebuild non-default rooms FIRST, before any per-room restore below, so
+  // their DOM (rating buttons, state bar, note fields, photo grids) exists when
+  // we restore into it. addRoomToUI no longer clobbers a restored section state
+  // (it only defaults to "not_started" when unset), and IK.sectionStates/ratings
+  // were already assigned above, so nothing is lost. ──
+  const defaultIds = INSPECTKIT_CONFIG.defaultRooms.map(r => r.id);
+  (data.rooms || []).forEach(room => {
+    if (!room.active) return;
+    const isDefault = defaultIds.includes(room.id);
+    if (!isDefault) {
+      addRoomToUI(room, true);
+    } else {
+      // Toggle optional default rooms (ensuite, garage etc) if active in saved data
+      const pill = document.getElementById("toggle-" + room.id);
+      const defaultRoom = INSPECTKIT_CONFIG.defaultRooms.find(r => r.id === room.id);
+      if (pill && defaultRoom && !defaultRoom.active) {
+        if (!document.getElementById("panel-room-" + room.id)) {
+          addRoomToUI(room, true);
+          pill.classList.add("active");
+        }
+      }
+    }
+  });
 
   // ── Restore property details fields ──
   const pd = data.propertyDetails || {};
@@ -5496,9 +5923,21 @@ function resumeFromJSON(data) {
     setCheckItem(id, rating);
   });
 
-  // ── Restore nav badges from section states ──
+  // ── Restore section states: nav badge, the Inspected / Partial / Not-Inspected
+  // button highlight, AND the limitation panel. Previously only the badge was
+  // restored, so the status button looked un-ticked after reload/import even
+  // though the state was saved correctly. ──
   Object.entries(data.sectionStates || {}).forEach(([id, state]) => {
     updateNavBadge(id, state);
+    const bar = document.getElementById("state-bar-" + id);
+    if (bar) {
+      bar.querySelectorAll(".state-btn").forEach(b => {
+        b.className = "state-btn";
+        if (b.getAttribute("data-state") === state) b.classList.add("active-" + state);
+      });
+    }
+    const limPanel = document.getElementById(id + "-limitation-panel");
+    if (limPanel) limPanel.classList.toggle("visible", state === "not_inspected" || state === "partial");
   });
 
   // ── Restore overall assessment ──
@@ -5560,27 +5999,9 @@ function resumeFromJSON(data) {
     grid.appendChild(div);
   });
 
-  // ── Rebuild room nav and panels for any non-default rooms ──
-  // (default rooms already built at init — add any extra ones from saved data)
-  const defaultIds = INSPECTKIT_CONFIG.defaultRooms.map(r => r.id);
-  (data.rooms || []).forEach(room => {
-    if (!room.active) return;
-    const isDefault = defaultIds.includes(room.id);
-    if (!isDefault) {
-      addRoomToUI(room, true);
-    } else {
-      // Toggle optional default rooms (ensuite, garage etc) if active in saved data
-      const pill = document.getElementById("toggle-" + room.id);
-      const defaultRoom = INSPECTKIT_CONFIG.defaultRooms.find(r => r.id === room.id);
-      if (pill && defaultRoom && !defaultRoom.active) {
-        // Was off by default, now active in saved data
-        if (!document.getElementById("panel-room-" + room.id)) {
-          addRoomToUI(room, true);
-          pill.classList.add("active");
-        }
-      }
-    }
-  });
+  // ── Optional-room rebuild moved UP (to right after IK.rooms/IK.fields are
+  //     assigned) so the per-room restores — fields/notes, ratings, section-state,
+  //     element photos — all land on DOM that already exists. See top of function. ──
 
   updateS1Progress();
   suggestOverallAssessment();
@@ -5592,7 +6013,9 @@ function resumeFromJSON(data) {
   // target grids didn't exist yet).
   restoreMoistureReadings(data);
 
-  alert(`Inspection ${IK.reportNumber} loaded. You can continue from where you left off.`);
+  if (!opts.fromStore) {
+    alert(`Inspection ${IK.reportNumber} loaded. You can continue from where you left off.`);
+  }
   showSection("s1");
 }
 
@@ -5966,7 +6389,7 @@ function addRoomMoistureReading(sId) {
   div.innerHTML = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
       <div style="font-size:11px;font-weight:700;color:var(--secondary);text-transform:uppercase;letter-spacing:0.8px;">Reading ${n}</div>
-      <button class="add-btn" style="border-color:#C0392B;color:#C0392B;padding:3px 10px;font-size:11px;" onclick="document.getElementById('${id}-block').remove();autosave()">Remove</button>
+      <button class="add-btn" style="border-color:#C0392B;color:#C0392B;padding:3px 10px;font-size:11px;" onclick="removeRoomMoistureReading('${sId}','${id}')">Remove</button>
     </div>
     <div class="field-row">
       <div class="field-group">
@@ -5993,6 +6416,88 @@ function addRoomMoistureReading(sId) {
   `;
   container.appendChild(div);
   syncMoistureUploadVisibility(id);
+}
+
+// Remove a room moisture reading cleanly. The deleted reading's block, its saved
+// location/value, and its single photo are all discarded, then the survivors are
+// renumbered to a contiguous 1..N so the save routine can never truncate at a gap
+// and no deleted reading's data or orphaned photo is ever left behind.
+function removeRoomMoistureReading(sId, removeId) {
+  const target = document.getElementById(removeId + "-block");
+  if (target) target.remove();
+  normaliseRoomMoisture(sId);
+  autosave();
+}
+
+// Rebuild a room's surviving moisture readings as a contiguous 1..N list, keeping
+// each survivor's location, value and single photo attached. DOM ids, IK.fields
+// and IK.photos keys are all rewritten in lockstep (survivors are re-added through
+// the same builder used elsewhere), so no key can detach and no gap can remain.
+function normaliseRoomMoisture(sId) {
+  const container = document.getElementById(sId + "-moisture-readings");
+  if (!container) return;
+  if (!IK.photos) IK.photos = {};
+  if (!IK.fields) IK.fields = {};
+
+  // 1. Snapshot the survivors in DOM order from current (possibly unsaved) state.
+  const survivors = [];
+  container.querySelectorAll('[id$="-block"]').forEach(block => {
+    const bid = block.id;
+    if (!bid.startsWith(sId + "-moist-")) return;
+    const mid = bid.slice((sId + "-moist-").length, -"-block".length);
+    if (!/^\d+$/.test(mid)) return;
+    const base  = sId + "-moist-" + mid;
+    const locEl = document.getElementById(base + "-location");
+    const valEl = document.getElementById(base + "-value");
+    let photo = null;
+    Object.keys(IK.photos).forEach(pid => {
+      const p = IK.photos[pid];
+      if (!photo && p && p.elemId === base) photo = { data: p.data, caption: p.caption || "" };
+    });
+    survivors.push({ loc: locEl ? locEl.value : "", val: valEl ? valEl.value : "", photo });
+  });
+
+  // 2. Wipe this room's moisture state entirely (DOM, fields, photos, counter).
+  Object.keys(IK.fields).forEach(k => {
+    if (k.startsWith(sId + "-moist-") &&
+        (k.endsWith("-location") || k.endsWith("-value"))) delete IK.fields[k];
+  });
+  Object.keys(IK.photos).forEach(pid => {
+    const p = IK.photos[pid];
+    if (p && typeof p.elemId === "string" && p.elemId.startsWith(sId + "-moist-")) delete IK.photos[pid];
+  });
+  container.innerHTML = "";
+  roomMoistureCounts[sId] = 0;
+
+  // 3. Re-add survivors contiguously via the tested builder, restoring loc/val/photo.
+  survivors.forEach(s => {
+    addRoomMoistureReading(sId);                 // creates sId-moist-<next contiguous>
+    const base  = sId + "-moist-" + roomMoistureCounts[sId];
+    const locEl = document.getElementById(base + "-location");
+    const valEl = document.getElementById(base + "-value");
+    if (locEl) locEl.value = s.loc;
+    if (valEl && s.val !== "") { valEl.value = s.val; classifyRoomMoisture(base); }
+    if (s.photo) {
+      const grid = document.getElementById(base + "-photos");
+      if (grid) {
+        const photoId = base + "-photo-" + Date.now() + "-" + Math.floor(Math.random() * 1e6);
+        const pdiv = document.createElement("div");
+        pdiv.className = "photo-thumb";
+        pdiv.id = photoId;
+        pdiv.innerHTML = `
+            <img src="${s.photo.data}" alt="Moisture reading photo">
+            <button class="photo-remove-btn" onclick="removePhoto('${photoId}')">×</button>
+            <input class="photo-caption-input" type="text"
+              placeholder="Caption (required for M, R, X)"
+              value="${(s.photo.caption || "").replace(/"/g, "&quot;")}"
+              oninput="autosave()">
+          `;
+        grid.appendChild(pdiv);
+        IK.photos[photoId] = { data: s.photo.data, elemId: base, caption: s.photo.caption || "" };
+        syncMoistureUploadVisibility(base);
+      }
+    }
+  });
 }
 
 // F1c: one photo per moisture reading. Hide the upload area when a photo is

@@ -3237,16 +3237,24 @@ function renderRoomMoistureReadings(data, sId) {
   if (maxReading === 0) return "";
 
   // Build reading entries
-  const readings = [];
+  const readingsAll = [];
   for (let i = 1; i <= maxReading; i++) {
     const base = sId + "-moist-" + i;
-    readings.push({
+    readingsAll.push({
       base,
       loc: fields[base + "-location"] || "",
       val: fields[base + "-value"] !== undefined && fields[base + "-value"] !== ""
         ? parseFloat(fields[base + "-value"]) : null,
     });
   }
+
+  // Drop empty / orphaned readings — a reading with no location AND no value is
+  // not a real reading (e.g. one removed in capture whose photo index was left
+  // behind). Dropping it here also excludes its orphaned photo, since the photo
+  // collector below iterates these survivors by r.base. Survivors renumber
+  // naturally via the map index; photo lookups use r.base so remain correct.
+  const readings = readingsAll.filter(r => (r.loc && r.loc.trim() !== "") || r.val !== null);
+  if (readings.length === 0) return "";
 
   function classify(val) {
     if (val === null) return { label: "—", bg: "#F4F6F7", color: "#666" };
@@ -3875,9 +3883,18 @@ function _splitPageIfNeeded(page, wrapper, depth) {
   const isContinuation = page.hasAttribute('data-continuation');
   let usablePx = isContinuation ? PAGE_USABLE_CONT_PX : PAGE_USABLE_FIRST_PX;
   if (page.getAttribute('data-section-title') === 'Significant Findings') {
-    usablePx = isContinuation ? 650 : 700;
+    usablePx = isContinuation ? 900 : 960;
   }
-  if (pageBody.scrollHeight <= usablePx) return;
+  // Measure real laid-out content height from the top of the first block to the
+  // bottom of the last. getBoundingClientRect includes the margins between
+  // blocks, which summing offsetHeight omits. That undercount let a page whose
+  // real height overflowed either slip past this check or find no split point,
+  // so the print engine broke it instead — producing an unlabelled orphan page
+  // (e.g. a Significant Findings bubble stranded at the top of a headerless page).
+  const _kids = Array.from(pageBody.children);
+  const _firstTop = _kids.length ? _kids[0].getBoundingClientRect().top : 0;
+  const _contentH = _kids.length ? (_kids[_kids.length - 1].getBoundingClientRect().bottom - _firstTop) : 0;
+  if (_contentH <= usablePx) return;
 
   // Extract the section title for the continuation label.
   const sectionTitleEl = pageBody.querySelector(".rp-section-title");
@@ -3917,27 +3934,24 @@ function _splitPageIfNeeded(page, wrapper, depth) {
   // of the whole list — it must stay with the title, never move to a continuation.
   const fixedClasses = ["rp-section-tag","rp-section-title","rp-limitation","rp-status-block","rp-status-pill","rp-continuation","rp-findings-tally"];
 
+  // Baseline: top of the first block. Measuring each element's real bottom
+  // relative to it (margins included) keeps the split point consistent with the
+  // overflow check above — the fix for the margin undercount.
+  const firstTop = allChildren.length ? allChildren[0].getBoundingClientRect().top : 0;
   for (let i = 0; i < allChildren.length; i++) {
     const el = allChildren[i];
     const isFixed = fixedClasses.some(cls => el.classList.contains(cls));
 
     if (isFixed) {
-      accHeight += el.offsetHeight;
       fixedEls.add(i);
       continue;
     }
 
-    // This element can potentially be moved to a continuation page
-    const elH = el.offsetHeight;
-
-    // Available height on first page: usable minus header elements already placed
-    const availFirst = usablePx - accHeight;
-
-    if (accHeight + elH > usablePx && splitIndex === -1) {
-      // This element would overflow — split here (before this element)
+    // Split before the first element whose real bottom crosses the usable budget.
+    const elBottom = el.getBoundingClientRect().bottom - firstTop;
+    if (elBottom > usablePx && splitIndex === -1) {
       splitIndex = i;
     }
-    accHeight += elH;
   }
 
   if (splitIndex === -1) return; // layout says no split needed after measuring
@@ -3979,7 +3993,7 @@ function _splitPageIfNeeded(page, wrapper, depth) {
   const contBody = document.createElement("div");
   contBody.className = "page-body";
   // Override top padding to account for the continuation label
-  contBody.style.paddingTop = "12mm";
+  contBody.style.paddingTop = "6mm";
 
   // Continuation label
   const contLabel = document.createElement("div");
