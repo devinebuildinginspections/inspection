@@ -3190,7 +3190,7 @@ function renderRoomPage(data, pd, cfg, rn, room) {
     const moistureHtml = renderRoomMoistureReadings(data, sId);
     const floorHtml    = renderRoomFloorLevel(data, sId);
     if (moistureHtml || floorHtml) {
-      bodyContent += `<div class="rp-moisture-floor-group">${moistureHtml || ""}${floorHtml || ""}</div>`;
+      bodyContent += (moistureHtml || "") + (floorHtml || "");
     }
 
     // General observations
